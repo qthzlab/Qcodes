@@ -9,34 +9,17 @@ Installation:
     pip install qcodes pyvisa pyvisa-py pyserial
 
 Usage:
-    from dht11_qcodes_driver import ArduinoDHT11
+    from DHT11 import ArduinoDHT11
     
     # Connect to the instrument
-    dht = ArduinoDHT11('dht11', 'ASRL/dev/ttyACM0::INSTR')  # Linux
-    # dht = ArduinoDHT11('dht11', 'ASRLCOM3::INSTR')        # Windows
+    dht = ArduinoDHT11('dht11', 'ASRL3::INSTR', visalib='@py')
     
     # Query measurements
     temp = dht.temperature()
     hum = dht.humidity()
-    
-    # Or get both at once
-    temp, hum = dht.get_all()
-    
-    # Configure
-    dht.unit('F')           # Fahrenheit
-    dht.averaging(4)        # 4-point averaging
-    
-    # Streaming mode for continuous monitoring
-    dht.mode('STREAM')
-    dht.stream_interval(5000)  # 5 seconds
-    dht.start_streaming()
-    
-    # Read stream data
-    for data in dht.read_stream(timeout=30):
-        print(f"T={data['temperature']}, H={data['humidity']}")
 
 Author: Abhay's Lab @ GSU
-Version: 1.0.0
+Version: 1.1.0
 """
 
 import re
@@ -44,7 +27,7 @@ import time
 import logging
 from typing import Optional, Tuple, Dict, Generator, Any
 
-from qcodes import Instrument, VisaInstrument
+from qcodes import VisaInstrument
 from qcodes.parameters import Parameter
 from qcodes.validators import Enum, Numbers, Ints
 
@@ -59,21 +42,13 @@ class ArduinoDHT11(VisaInstrument):
     
     Args:
         name: Instrument name for QCoDeS
-        address: VISA resource string (e.g., 'ASRL/dev/ttyACM0::INSTR')
+        address: VISA resource string (e.g., 'ASRL3::INSTR')
         timeout: Communication timeout in seconds (default: 5)
+        reset_delay: Time to wait for Arduino reset in seconds (default: 3.0)
         **kwargs: Additional arguments passed to VisaInstrument
     
-    Attributes:
-        temperature: Current temperature reading (in configured units)
-        humidity: Current relative humidity reading (%)
-        unit: Temperature unit ('C', 'F', or 'K')
-        averaging: Number of samples to average (1-16)
-        mode: Operating mode ('QUERY' or 'STREAM')
-        stream_interval: Streaming interval in milliseconds
-        streaming: Whether streaming is currently active
-    
     Example:
-        >>> dht = ArduinoDHT11('dht11', 'ASRL/dev/ttyACM0::INSTR')
+        >>> dht = ArduinoDHT11('dht11', 'ASRL3::INSTR', visalib='@py')
         >>> print(f"Temperature: {dht.temperature()} °C")
         >>> print(f"Humidity: {dht.humidity()} %")
     """
@@ -83,6 +58,7 @@ class ArduinoDHT11(VisaInstrument):
         name: str,
         address: str,
         timeout: float = 5,
+        reset_delay: float = 3.0,
         **kwargs: Any
     ) -> None:
         
@@ -92,11 +68,16 @@ class ArduinoDHT11(VisaInstrument):
         self.visa_handle.baud_rate = 115200
         self.visa_handle.timeout = timeout * 1000  # Convert to ms
         
-        # Clear any pending data
-        self._clear_buffer()
+        # =====================================================================
+        # ARDUINO RESET HANDLING
+        # =====================================================================
+        # Arduino Mega resets when serial port opens. The firmware now sends
+        # "READY" when it's fully initialized. We wait for this message.
         
-        # small delay before first command
-        time.sleep(0.1)
+        logger.info("Waiting for Arduino to initialize...")
+        
+        # Wait for READY message from Arduino
+        self._wait_for_ready(timeout=reset_delay + 5)
         
         # Verify connection by checking IDN
         idn = self.get_idn()
@@ -114,7 +95,7 @@ class ArduinoDHT11(VisaInstrument):
             'temperature',
             get_cmd='MEAS:TEMP?',
             get_parser=self._parse_float,
-            unit='°C',  # Updated dynamically based on unit setting
+            unit='°C',
             label='Temperature',
             docstring='Current temperature reading in configured units'
         )
@@ -177,8 +158,74 @@ class ArduinoDHT11(VisaInstrument):
             docstring='Whether streaming is currently active'
         )
         
-        # Connect to the instrument and initialize
         self.connect_message()
+    
+    # =========================================================================
+    # BUFFER CLEARING - CRITICAL FOR ARDUINO RESET
+    # =========================================================================
+    
+    def _clear_buffer_raw(self) -> None:
+        """
+        Clear any pending data in the serial buffer using RAW reads.
+        
+        This avoids UnicodeDecodeError on garbage bytes from Arduino reset.
+        """
+        old_timeout = self.visa_handle.timeout
+        self.visa_handle.timeout = 200  # Short timeout for clearing
+        
+        cleared_bytes = 0
+        try:
+            for _ in range(20):  # Max 20 attempts
+                try:
+                    # Use read_raw() to avoid decode errors
+                    chunk = self.visa_handle.read_raw()
+                    cleared_bytes += len(chunk)
+                    time.sleep(0.05)
+                except Exception:
+                    # Timeout = buffer empty
+                    break
+        finally:
+            self.visa_handle.timeout = old_timeout
+        
+        if cleared_bytes > 0:
+            logger.debug(f"Cleared {cleared_bytes} bytes from buffer")
+    
+    def _wait_for_ready(self, timeout: float = 10) -> None:
+        """
+        Wait for Arduino to send READY message after reset.
+        
+        This ensures all bootloader garbage is done and firmware is running.
+        """
+        old_timeout = self.visa_handle.timeout
+        self.visa_handle.timeout = int(timeout * 1000)
+        
+        start_time = time.time()
+        
+        try:
+            while time.time() - start_time < timeout:
+                try:
+                    # Read raw to avoid decode errors on garbage
+                    data = self.visa_handle.read_raw()
+                    
+                    # Try to decode - if it works, check for READY
+                    try:
+                        text = data.decode('ascii', errors='ignore').strip()
+                        if 'READY' in text:
+                            logger.info("Arduino ready")
+                            return
+                    except:
+                        pass
+                    
+                except Exception:
+                    # Timeout on read, keep waiting
+                    time.sleep(0.1)
+            
+            # If we get here, no READY received - try anyway
+            logger.warning("No READY message received, attempting connection anyway")
+            self._clear_buffer_raw()
+            
+        finally:
+            self.visa_handle.timeout = old_timeout
     
     # =========================================================================
     # PUBLIC METHODS
@@ -206,7 +253,6 @@ class ArduinoDHT11(VisaInstrument):
         response = self.ask('*RST')
         if response.strip() != 'OK':
             raise RuntimeError(f"Reset failed: {response}")
-        # Update cached parameter values
         self.unit.get()
         self.averaging.get()
         self.mode.get()
@@ -217,19 +263,13 @@ class ArduinoDHT11(VisaInstrument):
         
         Returns:
             Tuple of (temperature, humidity)
-        
-        Example:
-            >>> temp, hum = dht.get_all()
-            >>> print(f"T={temp}, H={hum}")
         """
         response = self.ask('MEAS:ALL?')
         
-        # Parse "TEMP:23.50,HUM:45.00"
         match = re.match(r'TEMP:([\d.-]+),HUM:([\d.-]+)', response.strip())
         if match:
             return float(match.group(1)), float(match.group(2))
         
-        # Check for error
         if response.startswith('ERR:'):
             raise RuntimeError(f"Measurement error: {response}")
         
@@ -241,7 +281,6 @@ class ArduinoDHT11(VisaInstrument):
         
         Returns:
             Tuple of (error_code, error_message)
-            Error code 0 means no error.
         """
         response = self.ask('SYST:ERR?')
         parts = response.strip().split(':', 1)
@@ -252,12 +291,7 @@ class ArduinoDHT11(VisaInstrument):
         return code, message
     
     def start_streaming(self) -> None:
-        """
-        Start continuous data streaming.
-        
-        The instrument must be in STREAM mode first.
-        Use read_stream() to receive the data.
-        """
+        """Start continuous data streaming."""
         if self.mode() != 'STREAM':
             raise RuntimeError("Set mode to STREAM first: dht.mode('STREAM')")
         
@@ -285,33 +319,20 @@ class ArduinoDHT11(VisaInstrument):
         
         Yields:
             Dictionary with keys: temperature, humidity, timestamp
-        
-        Example:
-            >>> dht.mode('STREAM')
-            >>> dht.start_streaming()
-            >>> for data in dht.read_stream(timeout=30, max_samples=10):
-            ...     print(f"T={data['temperature']}, H={data['humidity']}")
-            >>> dht.stop_streaming()
         """
         samples = 0
         start_time = time.time()
         
         while True:
-            # Check timeout
             if time.time() - start_time > timeout:
-                logger.info("Stream read timeout reached")
                 break
             
-            # Check sample limit
             if max_samples is not None and samples >= max_samples:
-                logger.info(f"Reached maximum samples: {max_samples}")
                 break
             
             try:
-                # Read with short timeout to stay responsive
                 line = self.visa_handle.read()
                 
-                # Parse stream data: "DATA:TEMP:23.50,HUM:45.00,TIME:123456"
                 if line.startswith('DATA:'):
                     match = re.match(
                         r'DATA:TEMP:([\d.-]+),HUM:([\d.-]+),TIME:(\d+)',
@@ -326,15 +347,12 @@ class ArduinoDHT11(VisaInstrument):
                         }
                 
             except Exception as e:
-                # Timeout or other error - continue trying
                 if 'timeout' not in str(e).lower():
                     logger.warning(f"Stream read error: {e}")
     
     def wait_for_valid_reading(self, timeout: float = 10) -> bool:
         """
         Wait until a valid sensor reading is available.
-        
-        The DHT11 needs time after power-on to provide valid readings.
         
         Args:
             timeout: Maximum time to wait in seconds
@@ -357,40 +375,10 @@ class ArduinoDHT11(VisaInstrument):
     # PRIVATE METHODS
     # =========================================================================
     
-    def _clear_buffer(self) -> None:
-        """Clear any pending data in the serial buffer."""
-        try:
-            # Set short timeout for clearing
-            old_timeout = self.visa_handle.timeout
-            self.visa_handle.timeout = 100  # 100 ms
-            
-            while True:
-                try:
-                    self.visa_handle.read()
-                except:
-                    break
-            
-            self.visa_handle.timeout = old_timeout
-        except:
-            pass
-    
     def _parse_float(self, response: str) -> float:
-        """
-        Parse a float response, handling errors.
-        
-        Args:
-            response: Raw response string from instrument
-        
-        Returns:
-            Parsed float value
-        
-        Raises:
-            RuntimeError: If response indicates an error
-            ValueError: If response cannot be parsed
-        """
+        """Parse a float response, handling errors."""
         response = response.strip()
         
-        # Check for error response
         if response.startswith('ERR:'):
             raise RuntimeError(f"Instrument error: {response}")
         
@@ -401,11 +389,7 @@ class ArduinoDHT11(VisaInstrument):
     
     def _update_temp_unit(self, value: str) -> None:
         """Update the temperature parameter unit after changing unit setting."""
-        unit_map = {
-            'C': '°C',
-            'F': '°F',
-            'K': 'K'
-        }
+        unit_map = {'C': '°C', 'F': '°F', 'K': 'K'}
         self.temperature.unit = unit_map.get(value, '°C')
 
 
@@ -414,20 +398,11 @@ class ArduinoDHT11(VisaInstrument):
 # =============================================================================
 
 def find_arduino_ports() -> list:
-    """
-    Find available Arduino serial ports.
-    
-    Returns:
-        List of VISA resource strings for potential Arduino devices
-    """
+    """Find available Arduino serial ports."""
     import pyvisa
     rm = pyvisa.ResourceManager('@py')
     resources = rm.list_resources()
-    
-    # Filter for serial ports
-    serial_ports = [r for r in resources if r.startswith('ASRL')]
-    
-    return serial_ports
+    return [r for r in resources if r.startswith('ASRL')]
 
 
 def create_dht11_instrument(
@@ -437,111 +412,25 @@ def create_dht11_instrument(
     """
     Convenience function to create a DHT11 instrument.
     
-    If port is not specified, attempts to find an Arduino automatically.
-    
     Args:
         name: Instrument name for QCoDeS
-        port: Serial port (e.g., '/dev/ttyACM0' or 'COM3')
-               If None, attempts auto-detection
+        port: Serial port (e.g., 'COM3' or 'ASRL3::INSTR')
     
     Returns:
         Configured ArduinoDHT11 instance
-    
-    Example:
-        >>> dht = create_dht11_instrument()
-        >>> print(dht.temperature())
     """
     if port is None:
         ports = find_arduino_ports()
         if not ports:
-            raise RuntimeError(
-                "No serial ports found. Please specify port manually."
-            )
-        # Try each port
-        for p in ports:
-            try:
-                dht = ArduinoDHT11(name, p)
-                logger.info(f"Connected to DHT11 on {p}")
-                return dht
-            except Exception as e:
-                logger.debug(f"Failed to connect to {p}: {e}")
-                continue
-        
-        raise RuntimeError(
-            f"Could not connect to DHT11 on any port: {ports}"
-        )
+            raise RuntimeError("No serial ports found.")
+        port = ports[0]
+        logger.info(f"Auto-detected port: {port}")
     
     # Convert simple port name to VISA resource string
     if not port.startswith('ASRL'):
-        if port.startswith('/dev/'):
-            # Linux
-            port = f'ASRL{port}::INSTR'
-        elif port.upper().startswith('COM'):
-            # Windows
-            port = f'ASRL{port}::INSTR'
+        if port.upper().startswith('COM'):
+            # COM3 -> ASRL3::INSTR
+            num = port.upper().replace('COM', '')
+            port = f'ASRL{num}::INSTR'
     
-    return ArduinoDHT11(name, port)
-
-
-# =============================================================================
-# EXAMPLE USAGE
-# =============================================================================
-
-if __name__ == '__main__':
-    """Example demonstrating basic usage of the DHT11 driver."""
-    
-    import logging
-    logging.basicConfig(level=logging.INFO)
-    
-    print("=" * 60)
-    print("Arduino DHT11 QCoDeS Driver - Example")
-    print("=" * 60)
-    
-    # Try to find and connect to the instrument
-    try:
-        dht = create_dht11_instrument('dht11')
-    except RuntimeError as e:
-        print(f"\nError: {e}")
-        print("\nTo connect manually, use:")
-        print("  dht = ArduinoDHT11('dht11', 'ASRL/dev/ttyACM0::INSTR')  # Linux")
-        print("  dht = ArduinoDHT11('dht11', 'ASRLCOM3::INSTR')          # Windows")
-        exit(1)
-    
-    # Display identification
-    idn = dht.get_idn()
-    print(f"\nConnected to: {idn['vendor']} {idn['model']}")
-    print(f"Serial: {idn['serial']}, Firmware: {idn['firmware']}")
-    
-    # Wait for valid reading
-    print("\nWaiting for valid sensor reading...")
-    if not dht.wait_for_valid_reading(timeout=10):
-        print("Warning: Could not get valid reading within timeout")
-    
-    # Read measurements
-    print("\n--- Current Readings ---")
-    try:
-        temp, hum = dht.get_all()
-        print(f"Temperature: {temp:.1f} °C")
-        print(f"Humidity: {hum:.1f} %")
-    except RuntimeError as e:
-        print(f"Measurement error: {e}")
-    
-    # Show configuration
-    print("\n--- Configuration ---")
-    print(f"Unit: {dht.unit()}")
-    print(f"Averaging: {dht.averaging()}")
-    print(f"Mode: {dht.mode()}")
-    print(f"Stream Interval: {dht.stream_interval()} ms")
-    
-    # Example: Change unit to Fahrenheit
-    print("\n--- Changing to Fahrenheit ---")
-    dht.unit('F')
-    temp = dht.temperature()
-    print(f"Temperature: {temp:.1f} °F")
-    
-    # Reset to defaults
-    dht.reset()
-    
-    # Close connection
-    dht.close()
-    print("\nConnection closed.")
+    return ArduinoDHT11(name, port, visalib='@py')
