@@ -4,7 +4,7 @@ QCoDeS Driver for Arduino DHT11 Sensor
 
 Simple and robust driver.
 
-Author: Abhay's Lab @ GSU
+Author: QTHz Lab @ GSU
 Version: 2.1.0
 """
 
