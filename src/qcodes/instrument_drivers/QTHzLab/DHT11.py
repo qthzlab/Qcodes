@@ -5,8 +5,13 @@ QCoDeS Driver for Arduino DHT11 Sensor
 Production-grade driver for 24/7 operation.
 Handles USB-serial garbage bytes issue.
 
+<<<<<<< HEAD
 Author: Abhay's Lab @ GSU
 Version: 3.1.0
+=======
+Author: QTHz Lab @ GSU
+Version: 2.1.0
+>>>>>>> 2dc0d22346755cde4edb20fdec28c823084ccaca
 """
 
 import time
