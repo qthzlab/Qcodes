@@ -1,3 +1,6 @@
+# Author : Samodi 
+# Date: 29th Dec 2025 
+
 import time
 from qcodes.instrument import VisaInstrument, InstrumentChannel
 from qcodes.validators import Numbers
