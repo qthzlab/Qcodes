@@ -2,7 +2,7 @@
 QCoDeS Driver for Arduino DHT11 SCPI-like Instrument
 =====================================================
 
-Version: 1.4.0 - Overrides ask() to handle Arduino garbage bytes
+Version: 1.5.0 - More robust serial communication with retries
 
 Author: Abhay's Lab @ GSU
 """
@@ -22,10 +22,10 @@ logger = logging.getLogger(__name__)
 class ArduinoDHT11(VisaInstrument):
     """
     QCoDeS driver for Arduino Mega + DHT11 temperature/humidity sensor.
-    
-    This driver overrides the standard ask() method to handle
-    garbage bytes from Arduino bootloader reset.
     """
+    
+    # Minimum delay between commands (seconds)
+    COMMAND_DELAY = 0.3
     
     def __init__(
         self,
@@ -42,21 +42,18 @@ class ArduinoDHT11(VisaInstrument):
         self.visa_handle.baud_rate = 115200
         self.visa_handle.timeout = timeout * 1000
         
+        # Track last command time to enforce delays
+        self._last_command_time = 0
+        
         # =====================================================================
         # ARDUINO RESET HANDLING
         # =====================================================================
         logger.info(f"Waiting {reset_delay}s for Arduino to initialize...")
-        
-        # Just wait for Arduino to fully boot
         time.sleep(reset_delay)
-        
-        # Flush everything using raw reads
         self._flush_buffer_aggressive()
-        
-        # Extra wait
         time.sleep(0.5)
         
-        # Test connection using our custom ask
+        # Test connection
         try:
             idn_response = self.ask('*IDN?')
             logger.info(f"Connected: {idn_response}")
@@ -126,46 +123,74 @@ class ArduinoDHT11(VisaInstrument):
             label='Streaming Status'
         )
         
-        # Skip connect_message - it calls get_idn which might fail
-        # self.connect_message()
         logger.info(f"ArduinoDHT11 '{name}' initialized")
     
     # =========================================================================
-    # OVERRIDE ask() TO HANDLE GARBAGE BYTES
+    # ROBUST SERIAL COMMUNICATION
     # =========================================================================
     
-    def ask(self, cmd: str) -> str:
+    def _wait_for_ready(self) -> None:
+        """Ensure minimum delay between commands."""
+        elapsed = time.time() - self._last_command_time
+        if elapsed < self.COMMAND_DELAY:
+            time.sleep(self.COMMAND_DELAY - elapsed)
+    
+    def ask(self, cmd: str, max_retries: int = 3) -> str:
         """
-        Override ask() to use raw reads and handle garbage bytes.
+        Send command and get response with retries.
         """
-        # Write command
-        self.visa_handle.write(cmd)
-        time.sleep(0.1)  # Give Arduino time to respond
+        last_error = None
         
-        # Read response using raw method
-        max_attempts = 3
-        for attempt in range(max_attempts):
+        for attempt in range(max_retries):
             try:
+                # Ensure minimum delay between commands
+                self._wait_for_ready()
+                
+                # Clear any garbage in buffer before sending
+                self._quick_flush()
+                
+                # Write command
+                self.visa_handle.write(cmd)
+                self._last_command_time = time.time()
+                
+                # Wait for Arduino to process
+                time.sleep(0.15)
+                
+                # Read response
                 raw_data = self.visa_handle.read_raw()
-                
-                # Decode ignoring bad bytes
                 response = raw_data.decode('ascii', errors='ignore').strip()
-                
-                # Remove any null characters or other garbage
-                response = ''.join(c for c in response if c.isprintable() or c in '\n\r')
+                response = ''.join(c for c in response if c.isprintable())
                 response = response.strip()
                 
                 if response:
+                    # Check if it's an error about unknown command (retry)
+                    if 'ERR:100' in response and attempt < max_retries - 1:
+                        logger.debug(f"Command may have been truncated, retrying: {response}")
+                        time.sleep(0.3)
+                        continue
                     return response
                     
             except Exception as e:
-                if attempt < max_attempts - 1:
-                    logger.debug(f"Read attempt {attempt + 1} failed: {e}")
-                    time.sleep(0.2)
-                else:
-                    raise
+                last_error = e
+                logger.debug(f"Attempt {attempt + 1} failed: {e}")
+                time.sleep(0.3)
         
+        if last_error:
+            raise last_error
         raise RuntimeError(f"No valid response for command: {cmd}")
+    
+    def _quick_flush(self) -> None:
+        """Quick flush of serial buffer."""
+        old_timeout = self.visa_handle.timeout
+        self.visa_handle.timeout = 50  # Very short
+        try:
+            for _ in range(5):
+                try:
+                    self.visa_handle.read_raw()
+                except:
+                    break
+        finally:
+            self.visa_handle.timeout = old_timeout
     
     def ask_raw(self, cmd: str) -> str:
         """Override ask_raw to use our custom ask."""
@@ -173,7 +198,9 @@ class ArduinoDHT11(VisaInstrument):
     
     def write(self, cmd: str) -> None:
         """Write a command without expecting a response."""
+        self._wait_for_ready()
         self.visa_handle.write(cmd)
+        self._last_command_time = time.time()
     
     # =========================================================================
     # BUFFER MANAGEMENT
@@ -186,14 +213,10 @@ class ArduinoDHT11(VisaInstrument):
         
         total_flushed = 0
         try:
-            for _ in range(100):  # Up to 100 attempts
+            for _ in range(100):
                 try:
                     data = self.visa_handle.read_raw()
                     total_flushed += len(data)
-                    
-                    # Log what we're flushing (decoded)
-                    text = data.decode('ascii', errors='replace')
-                    logger.debug(f"Flushed: {repr(text)}")
                 except:
                     break
         finally:
@@ -225,14 +248,32 @@ class ArduinoDHT11(VisaInstrument):
             raise RuntimeError(f"Reset failed: {response}")
     
     def get_all(self) -> Tuple[float, float]:
-        """Query both temperature and humidity."""
+        """
+        Query both temperature and humidity in a single command.
+        More reliable than separate calls.
+        """
         response = self.ask('MEAS:ALL?')
         
+        # Try to parse response
         match = re.match(r'TEMP:([\d.-]+),HUM:([\d.-]+)', response.strip())
         if match:
             return float(match.group(1)), float(match.group(2))
         
+        # If that didn't work, maybe response format is different
+        if response.startswith('ERR:'):
+            raise RuntimeError(f"Measurement error: {response}")
+        
         raise ValueError(f"Unexpected response: {response}")
+    
+    def get_temperature(self) -> float:
+        """Get temperature with automatic retry."""
+        response = self.ask('MEAS:TEMP?')
+        return self._parse_float(response)
+    
+    def get_humidity(self) -> float:
+        """Get humidity with automatic retry."""
+        response = self.ask('MEAS:HUM?')
+        return self._parse_float(response)
     
     def get_error(self) -> Tuple[int, str]:
         """Query and clear the last error."""
